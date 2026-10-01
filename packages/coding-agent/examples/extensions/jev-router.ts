@@ -1,22 +1,10 @@
 /**
- * Jev router - a virtual model that plans on a strong model and implements on a cheap one.
+ * Jev router with three cost/quality modes. Jev classifies each new user prompt;
+ * tool follow-ups and retries stay on the model chosen for that turn.
  *
- * Registers `jev/auto`, which routes between three OpenAI Codex models:
- *
- * - Planning: GPT-5.6 Sol for complex work, GPT-5.6 Terra otherwise. The Jev classifier rates the
- *   first user message; planning stays on the chosen model.
- * - Implementation: GPT-5.6 Luna.
- *
- * The planning model explores, plans, and makes the first edit. After the first successful `edit`
- * or `write` tool call, the next request of the same turn goes to Luna, and the session stays
- * there. A session therefore switches models once and accepts a single prompt-cache miss.
- *
- * The phase is router state: Pi stores it on the session branch, so it follows the session tree
- * and survives compaction. The selected thinking level passes through as the reasoning effort of
- * the chosen model. Requests outside the agent loop, such as compaction summaries, go to Luna.
- *
- * Requires TypeSafe credentials (TYPESAFE_API_KEY) and an OpenAI Codex login.
+ * Requires TYPESAFE_API_KEY and an OpenAI Codex login.
  * Usage: pi -e ./jev-router.ts --model jev/auto
+ * Select jev/cheap or jev/max with /model or --model.
  */
 
 import type { Message } from "@earendil-works/pi-ai";
@@ -27,16 +15,20 @@ const SOL = "gpt-5.6-sol";
 const TERRA = "gpt-5.6-terra";
 const LUNA = "gpt-5.6-luna";
 
-/** Tools whose successful result means implementation has started. */
-const EDIT_TOOLS = new Set(["edit", "write"]);
+type Mode = "cheap" | "auto" | "max";
+type Complexity = "simple" | "standard" | "complex";
 
 interface JevState {
-	phase: "planning" | "implementation";
-	/** OpenAI Codex model for this phase. */
 	model: string;
 }
 
 type JevRequest = ModelRouteRequest<JevState>;
+
+const MODEL_BY_MODE: Record<Mode, Record<Complexity, string>> = {
+	cheap: { simple: LUNA, standard: LUNA, complex: TERRA },
+	auto: { simple: LUNA, standard: TERRA, complex: SOL },
+	max: { simple: SOL, standard: SOL, complex: SOL },
+};
 
 function routeTo(request: JevRequest, ctx: ExtensionContext, id: string, state?: JevState): ModelRoute<JevState> {
 	const model = ctx.modelRegistry.find(PROVIDER, id);
@@ -50,22 +42,9 @@ function lastUserText(messages: readonly Message[]): string {
 	return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 }
 
-/** Whether a tool call since the last user message edited a file successfully. */
-function editedThisTurn(messages: readonly Message[]): boolean {
-	const lastUser = messages.findLastIndex((message) => message.role === "user");
-	return messages
-		.slice(lastUser + 1)
-		.some((message) => message.role === "toolResult" && EDIT_TOOLS.has(message.toolName) && !message.isError);
-}
-
-/** Planning model for a new session: Sol for complex work, Terra otherwise or when Jev is unavailable. */
-async function choosePlanningModel(request: JevRequest, ctx: ExtensionContext): Promise<string> {
-	// Keep a planning model the session already uses, so switching to jev/auto costs no cache miss.
-	const previous = request.previous?.model;
-	if (previous?.provider === PROVIDER && (previous.id === SOL || previous.id === TERRA)) return previous.id;
-
+async function classifyComplexity(request: JevRequest, ctx: ExtensionContext): Promise<Complexity> {
 	const jev = ctx.modelRegistry.findOfType("classifier", "typesafe", "jev-latest");
-	if (!jev) return TERRA;
+	if (!jev) return "standard";
 	const result = await ctx.modelRegistry.classify(
 		jev,
 		{
@@ -73,10 +52,11 @@ async function choosePlanningModel(request: JevRequest, ctx: ExtensionContext): 
 			questions: {
 				complexity: {
 					type: "choice",
-					instructions: "How demanding is the software engineering work requested in `prompt`?",
+					instructions: "How demanding is the software engineering task requested in `prompt`?",
 					criteria: {
-						standard: "Ordinary features, fixes, reviews, or questions",
-						complex: "Subtle design, cross-cutting changes, or hard debugging",
+						simple: "Short questions, explanations, or small mechanical edits",
+						standard: "Ordinary features, fixes, reviews, or moderate debugging",
+						complex: "Subtle design, cross-cutting changes, difficult debugging, or high-stakes review",
 					},
 				},
 			},
@@ -84,30 +64,36 @@ async function choosePlanningModel(request: JevRequest, ctx: ExtensionContext): 
 		{ signal: request.signal },
 	);
 	const answer = result.stopReason === "stop" ? result.answers.complexity : undefined;
-	return answer?.type === "choice" && (answer.probabilities.complex ?? 0) >= 0.5 ? SOL : TERRA;
+	if (answer?.type !== "choice") return "standard";
+	if (answer.choice === "simple" || answer.choice === "standard" || answer.choice === "complex") return answer.choice;
+	return "standard";
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerVirtualModel<JevState>({
-		provider: "jev",
-		id: "auto",
-		name: "Auto (Jev)",
-		thinkingLevels: ["low", "medium", "high", "xhigh"],
-		// Shared by all three models; shown before the first response.
-		contextWindow: 272_000,
-		maxTokens: 128_000,
-		async route(request, ctx) {
-			if (request.reason === "direct") return routeTo(request, ctx, LUNA);
-			const state = request.state;
-			if (!state) {
-				const model = await choosePlanningModel(request, ctx);
-				return routeTo(request, ctx, model, { phase: "planning", model });
-			}
-			// The planning model made the first edit: hand the rest of the work to Luna.
-			if (state.phase === "planning" && editedThisTurn(request.messages)) {
-				return routeTo(request, ctx, LUNA, { phase: "implementation", model: LUNA });
-			}
-			return routeTo(request, ctx, state.model);
-		},
-	});
+	for (const mode of ["cheap", "auto", "max"] as const) {
+		pi.registerVirtualModel<JevState>({
+			provider: "jev",
+			id: mode,
+			name: `${mode[0].toUpperCase()}${mode.slice(1)} (Jev)`,
+			thinkingLevels: ["low", "medium", "high", "xhigh"],
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+			async route(request, ctx) {
+				if (request.reason === "direct") return routeTo(request, ctx, MODEL_BY_MODE[mode].standard);
+				if (request.reason === "retry" && request.failed) {
+					return { model: request.failed.model, thinkingLevel: request.failed.thinkingLevel ?? request.thinkingLevel };
+				}
+				if (request.reason === "continuation") {
+					const id = request.state?.model;
+					if (id) return routeTo(request, ctx, id);
+					if (request.previous) {
+						return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel ?? request.thinkingLevel };
+					}
+				}
+				const complexity = mode === "max" ? "standard" : await classifyComplexity(request, ctx);
+				const model = MODEL_BY_MODE[mode][complexity];
+				return routeTo(request, ctx, model, { model });
+			},
+		});
+	}
 }

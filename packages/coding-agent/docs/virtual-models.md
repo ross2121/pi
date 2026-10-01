@@ -111,4 +111,4 @@ The transcript already records the selection and every dispatched model, and `ct
 
 Routers can call other models through `ctx.modelRegistry`, for example `ctx.modelRegistry.classify()` with a classifier model from `ctx.modelRegistry.findOfType("classifier", provider, id)`. The call adds latency before the first token of the turn.
 
-See [`jev-router.ts`](../examples/extensions/jev-router.ts) for a complete router. It plans on a strong OpenAI Codex model chosen by the Jev classifier, lets that model make the first edit, and then switches once to a cheaper model, accepting a single prompt-cache miss. It keeps the phase as router state.
+See [`jev-router.ts`](../examples/extensions/jev-router.ts) for a complete router with `jev/cheap`, `jev/auto`, and `jev/max` selections. For Cheap and Auto, Jev classifies each new user prompt as simple, standard, or complex. Cheap routes to Luna except for complex work, which uses Terra; Auto routes to Luna, Terra, or Sol respectively. Max always uses Sol and needs no classification. Tool continuations and retries keep the chosen model for that turn. The chosen model is stored as router state on the session branch.
